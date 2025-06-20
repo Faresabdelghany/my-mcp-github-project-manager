@@ -1,182 +1,190 @@
 import { z } from 'zod';
-import { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { validateSchema, ValidationError } from '@/utils/validation.js';
-import { handleToolErrors } from '@/utils/errors.js';
 import { createModuleLogger } from '@/utils/logger.js';
+import { ToolResult, ToolExecutionContext } from '@/types/tools.js';
 
-// Base interface for all MCP tools
+/**
+ * Metadata for tool registration and documentation
+ */
 export interface ToolMetadata {
   name: string;
   description: string;
-  inputSchema: z.ZodSchema;
-  examples?: Array<{
-    name: string;
-    description: string;
-    arguments: any;
-  }>;
+  category?: string;
+  subcategory?: string;
+  functionType?: 'create' | 'read' | 'update' | 'delete' | 'execute';
+  version?: string;
+  stability?: 'stable' | 'beta' | 'alpha' | 'experimental';
+  tags?: string[];
+  examples?: ToolExample[];
 }
 
-// Base class for all MCP tools
-export abstract class BaseTool {
-  protected logger = createModuleLogger(this.constructor.name);
+export interface ToolExample {
+  name: string;
+  description: string;
+  arguments: Record<string, any>;
+  expectedResult?: any;
+}
 
-  abstract readonly metadata: ToolMetadata;
+/**
+ * Base abstract class for all MCP tools
+ * Provides common functionality for validation, execution, and error handling
+ */
+export abstract class BaseTool<TInput = any, TOutput = any> {
+  public abstract readonly metadata: ToolMetadata;
+  public abstract readonly schema: z.ZodSchema<TInput>;
+  
+  protected readonly logger = createModuleLogger(`Tool:${this.constructor.name}`);
+  private executionCount = 0;
+  private lastExecutionTime?: Date;
 
-  // Get the MCP tool definition
-  getTool(): Tool {
-    return {
-      name: this.metadata.name,
-      description: this.metadata.description,
-      inputSchema: this.zodSchemaToJsonSchema(this.metadata.inputSchema),
-    };
-  }
+  /**
+   * Execute the tool with validated input
+   */
+  async execute(input: TInput, context?: ToolExecutionContext): Promise<ToolResult<TOutput>> {
+    const startTime = Date.now();
+    this.executionCount++;
+    this.lastExecutionTime = new Date();
 
-  // Execute the tool with validated parameters
-  @handleToolErrors
-  async execute(args: unknown): Promise<any> {
-    this.logger.info(`Executing tool: ${this.metadata.name}`, { args });
+    this.logger.info('Tool execution started', {
+      toolName: this.metadata.name,
+      executionCount: this.executionCount,
+      input: this.sanitizeInputForLogging(input)
+    });
 
-    // Validate input parameters
-    const validatedArgs = this.validateInput(args);
-
-    // Execute the tool logic
-    const result = await this.executeImpl(validatedArgs);
-
-    this.logger.debug(`Tool execution completed: ${this.metadata.name}`, { result });
-    
-    return result;
-  }
-
-  // Abstract method to be implemented by concrete tools
-  protected abstract executeImpl(args: any): Promise<any>;
-
-  // Validate input against the schema
-  private validateInput(args: unknown): any {
     try {
-      return validateSchema(this.metadata.inputSchema, args);
+      // Validate input against schema
+      const validatedInput = await this.validateInput(input);
+      
+      // Execute the tool implementation
+      const result = await this.executeImpl(validatedInput, context);
+      
+      const duration = Date.now() - startTime;
+      this.logger.info('Tool execution completed', {
+        toolName: this.metadata.name,
+        executionCount: this.executionCount,
+        duration,
+        success: result.success
+      });
+
+      return result;
+
     } catch (error) {
-      this.logger.error(`Input validation failed for ${this.metadata.name}`, { args, error });
+      const duration = Date.now() - startTime;
+      this.logger.error('Tool execution failed', {
+        toolName: this.metadata.name,
+        executionCount: this.executionCount,
+        duration,
+        error: error instanceof Error ? error.message : String(error)
+      });
+
+      return this.createErrorResponse(
+        `Tool execution failed: ${error instanceof Error ? error.message : String(error)}`,
+        'TOOL_EXECUTION_ERROR',
+        { input, error: String(error) }
+      );
+    }
+  }
+
+  /**
+   * Abstract method to be implemented by concrete tools
+   */
+  protected abstract executeImpl(input: TInput, context?: ToolExecutionContext): Promise<ToolResult<TOutput>>;
+
+  /**
+   * Validate input against the tool's schema
+   */
+  protected async validateInput(input: TInput): Promise<TInput> {
+    try {
+      return this.schema.parse(input);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        const errorMessages = error.errors.map(err => 
+          `${err.path.join('.')}: ${err.message}`
+        ).join(', ');
+        throw new Error(`Input validation failed: ${errorMessages}`);
+      }
       throw error;
     }
   }
 
-  // Convert Zod schema to JSON Schema for MCP
-  private zodSchemaToJsonSchema(schema: z.ZodSchema): any {
-    // This is a simplified converter - in production you might want to use a library
-    return this.convertZodToJsonSchema(schema);
-  }
-
-  private convertZodToJsonSchema(schema: z.ZodSchema): any {
-    const def = schema._def;
-
-    switch (def.typeName) {
-      case 'ZodString':
-        return { type: 'string' };
-      
-      case 'ZodNumber':
-        return { type: 'number' };
-      
-      case 'ZodBoolean':
-        return { type: 'boolean' };
-      
-      case 'ZodArray':
-        return {
-          type: 'array',
-          items: this.convertZodToJsonSchema(def.type),
-        };
-      
-      case 'ZodObject':
-        const properties: any = {};
-        const required: string[] = [];
-
-        for (const [key, value] of Object.entries(def.shape())) {
-          properties[key] = this.convertZodToJsonSchema(value as z.ZodSchema);
-          
-          // Check if field is optional
-          if (!(value as any)._def.typeName === 'ZodOptional') {
-            required.push(key);
-          }
-        }
-
-        return {
-          type: 'object',
-          properties,
-          required: required.length > 0 ? required : undefined,
-          additionalProperties: false,
-        };
-      
-      case 'ZodOptional':
-        return this.convertZodToJsonSchema(def.innerType);
-      
-      case 'ZodEnum':
-        return {
-          type: 'string',
-          enum: def.values,
-        };
-      
-      case 'ZodLiteral':
-        return {
-          type: typeof def.value,
-          const: def.value,
-        };
-      
-      case 'ZodUnion':
-        return {
-          oneOf: def.options.map((option: z.ZodSchema) => 
-            this.convertZodToJsonSchema(option)
-          ),
-        };
-      
-      default:
-        // Fallback for unsupported types
-        return { type: 'string' };
-    }
-  }
-
-  // Helper method to create success response
-  protected createSuccessResponse(data: any, message?: string) {
+  /**
+   * Create a successful tool result
+   */
+  protected createSuccessResponse(data: TOutput, message?: string): ToolResult<TOutput> {
     return {
       success: true,
       data,
       message: message || 'Operation completed successfully',
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  // Helper method to create paginated response
-  protected createPaginatedResponse(
-    items: any[],
-    total: number,
-    page: number,
-    perPage: number
-  ) {
-    return {
-      success: true,
-      data: {
-        items,
-        pagination: {
-          total,
-          page,
-          perPage,
-          totalPages: Math.ceil(total / perPage),
-          hasNext: page * perPage < total,
-          hasPrev: page > 1,
-        },
-      },
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  // Helper method to format response with metadata
-  protected formatResponse(data: any, metadata?: any) {
-    return {
-      success: true,
-      data,
       metadata: {
-        tool: this.metadata.name,
-        executedAt: new Date().toISOString(),
-        ...metadata,
+        toolName: this.metadata.name,
+        executionTime: new Date().toISOString(),
+        version: this.metadata.version || '1.0.0'
+      }
+    };
+  }
+
+  /**
+   * Create an error tool result
+   */
+  protected createErrorResponse(
+    message: string, 
+    errorCode?: string, 
+    details?: any
+  ): ToolResult<TOutput> {
+    return {
+      success: false,
+      error: {
+        message,
+        code: errorCode || 'UNKNOWN_ERROR',
+        details
       },
+      metadata: {
+        toolName: this.metadata.name,
+        executionTime: new Date().toISOString(),
+        version: this.metadata.version || '1.0.0'
+      }
+    };
+  }
+
+  /**
+   * Sanitize input for logging (remove sensitive data)
+   */
+  protected sanitizeInputForLogging(input: TInput): any {
+    if (typeof input !== 'object' || input === null) {
+      return input;
+    }
+
+    const sensitiveFields = ['password', 'token', 'secret', 'key', 'apiKey', 'auth'];
+    const sanitized = { ...input } as any;
+
+    for (const field of sensitiveFields) {
+      if (field in sanitized) {
+        sanitized[field] = '[REDACTED]';
+      }
+    }
+
+    return sanitized;
+  }
+
+  /**
+   * Get tool execution statistics
+   */
+  getExecutionStats() {
+    return {
+      executionCount: this.executionCount,
+      lastExecutionTime: this.lastExecutionTime,
+      metadata: this.metadata
+    };
+  }
+
+  /**
+   * Get tool schema as JSON Schema for documentation
+   */
+  getSchemaDefinition() {
+    return {
+      name: this.metadata.name,
+      description: this.metadata.description,
+      inputSchema: this.schema,
+      examples: this.metadata.examples || []
     };
   }
 }

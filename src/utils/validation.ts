@@ -1,140 +1,197 @@
 import { z } from 'zod';
-import { ValidationError } from './errors.js';
+import { createModuleLogger } from './logger.js';
 
-// Common validation schemas
-export const GitHubIdSchema = z.string().min(1, 'ID cannot be empty');
-export const GitHubNodeIdSchema = z.string().regex(/^[A-Za-z0-9_=-]+$/, 'Invalid GitHub node ID');
+const logger = createModuleLogger('Validation');
 
-// Utility function to validate data against a schema
-export function validateSchema<T>(schema: z.ZodSchema<T>, data: unknown): T {
+/**
+ * Common validation schemas
+ */
+export const TitleSchema = z.string()
+  .min(1, 'Title is required')
+  .max(255, 'Title must be less than 255 characters')
+  .trim();
+
+export const DescriptionSchema = z.string()
+  .max(65535, 'Description must be less than 65535 characters')
+  .trim();
+
+export const StateSchema = z.enum(['open', 'closed'], {
+  errorMap: () => ({ message: 'State must be either open or closed' })
+});
+
+export const LabelSchema = z.string()
+  .min(1, 'Label cannot be empty')
+  .max(50, 'Label must be less than 50 characters')
+  .trim();
+
+export const StringArraySchema = z.array(z.string().trim().min(1))
+  .min(1, 'At least one item is required');
+
+export const DateStringSchema = z.string()
+  .refine(val => !isNaN(Date.parse(val)), {
+    message: 'Invalid date format'
+  });
+
+export const OptionalDateStringSchema = z.string()
+  .refine(val => val === '' || !isNaN(Date.parse(val)), {
+    message: 'Invalid date format'
+  })
+  .optional();
+
+export const EmailSchema = z.string()
+  .email('Invalid email format')
+  .max(254, 'Email must be less than 254 characters');
+
+export const UrlSchema = z.string()
+  .url('Invalid URL format')
+  .max(2048, 'URL must be less than 2048 characters');
+
+export const PositiveIntegerSchema = z.number()
+  .int('Must be an integer')
+  .positive('Must be a positive number');
+
+export const NonNegativeIntegerSchema = z.number()
+  .int('Must be an integer')
+  .min(0, 'Must be non-negative');
+
+/**
+ * Validate data against a Zod schema
+ */
+export async function validateSchema<T>(
+  schema: z.ZodSchema<T>,
+  data: unknown,
+  options?: {
+    stripUnknown?: boolean;
+    logErrors?: boolean;
+  }
+): Promise<T> {
+  const { stripUnknown = true, logErrors = true } = options || {};
+
   try {
-    return schema.parse(data);
+    if (stripUnknown) {
+      return schema.parse(data);
+    } else {
+      return schema.strict().parse(data);
+    }
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      const errorDetails = error.issues.map(issue => ({
-        path: issue.path.join('.'),
-        message: issue.message,
-        code: issue.code,
+    if (error instanceof z.ZodError && logErrors) {
+      const errorMessages = error.errors.map(err => ({
+        path: err.path.join('.'),
+        message: err.message,
+        received: err.received
       }));
-
-      throw new ValidationError(
-        `Validation failed: ${errorDetails.map(e => `${e.path}: ${e.message}`).join(', ')}`,
-        errorDetails
-      );
+      
+      logger.error('Schema validation failed', {
+        schema: schema.constructor.name,
+        errors: errorMessages,
+        data: typeof data === 'object' ? JSON.stringify(data) : data
+      });
     }
     throw error;
   }
 }
 
-// Validation decorator for method parameters
-export function ValidateParams(schema: z.ZodSchema) {
-  return function (target: any, propertyName: string, descriptor: PropertyDescriptor) {
-    const method = descriptor.value;
-
-    descriptor.value = function (...args: any[]) {
-      const [params] = args;
-      const validatedParams = validateSchema(schema, params);
-      return method.apply(this, [validatedParams, ...args.slice(1)]);
-    };
-
-    return descriptor;
-  };
+/**
+ * Create a validation error message from Zod error
+ */
+export function formatValidationError(error: z.ZodError): string {
+  return error.errors
+    .map(err => `${err.path.join('.')}: ${err.message}`)
+    .join(', ');
 }
 
-// GitHub-specific validators
-export const GitHubTokenSchema = z.string()
-  .min(1, 'GitHub token is required')
-  .regex(/^gh[ps]_[A-Za-z0-9_]{36,255}$/, 'Invalid GitHub token format');
+/**
+ * Validate and sanitize user input
+ */
+export function sanitizeInput(input: string, options?: {
+  maxLength?: number;
+  allowedCharacters?: RegExp;
+  trim?: boolean;
+}): string {
+  const { maxLength = 1000, allowedCharacters, trim = true } = options || {};
+  
+  let sanitized = input;
+  
+  if (trim) {
+    sanitized = sanitized.trim();
+  }
+  
+  if (maxLength && sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength);
+  }
+  
+  if (allowedCharacters && !allowedCharacters.test(sanitized)) {
+    throw new Error('Input contains invalid characters');
+  }
+  
+  return sanitized;
+}
 
-export const GitHubOwnerSchema = z.string()
-  .min(1, 'GitHub owner is required')
-  .max(39, 'GitHub owner name too long')
-  .regex(/^[a-zA-Z0-9-]+$/, 'Invalid GitHub owner format');
+/**
+ * Validate GitHub username format
+ */
+export const GitHubUsernameSchema = z.string()
+  .min(1, 'Username is required')
+  .max(39, 'Username must be less than 39 characters')
+  .regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$/, 
+    'Invalid GitHub username format');
 
-export const GitHubRepoSchema = z.string()
+/**
+ * Validate GitHub repository name format
+ */
+export const GitHubRepoNameSchema = z.string()
   .min(1, 'Repository name is required')
-  .max(100, 'Repository name too long')
-  .regex(/^[a-zA-Z0-9._-]+$/, 'Invalid repository name format');
+  .max(100, 'Repository name must be less than 100 characters')
+  .regex(/^[a-zA-Z0-9._-]+$/, 
+    'Repository name can only contain alphanumeric characters, periods, hyphens, and underscores');
 
-// Common field validators
-export const TitleSchema = z.string()
-  .min(1, 'Title is required')
-  .max(255, 'Title too long');
+/**
+ * Validate semver version format
+ */
+export const SemverSchema = z.string()
+  .regex(/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?(?:\+[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)?$/, 
+    'Invalid semantic version format');
 
-export const DescriptionSchema = z.string()
-  .max(65535, 'Description too long')
-  .optional();
+/**
+ * Validate color hex code
+ */
+export const HexColorSchema = z.string()
+  .regex(/^#?[0-9A-Fa-f]{6}$/, 'Invalid hex color format');
 
-export const LabelSchema = z.string()
-  .min(1, 'Label cannot be empty')
-  .max(50, 'Label too long');
-
-export const StateSchema = z.enum(['open', 'closed']);
-
-export const PrioritySchema = z.enum(['low', 'medium', 'high', 'critical']);
-
-export const ComplexitySchema = z.number()
-  .min(1, 'Complexity must be at least 1')
-  .max(10, 'Complexity cannot exceed 10');
-
-// Date validation helpers
-export const DateStringSchema = z.string()
-  .datetime({ message: 'Invalid date format. Use ISO 8601 format.' });
-
-export const OptionalDateStringSchema = DateStringSchema.optional();
-
-// URL validation
-export const UrlSchema = z.string()
-  .url('Invalid URL format')
-  .optional();
-
-// Array validation helpers
-export const NonEmptyStringArraySchema = z.array(z.string().min(1))
-  .min(1, 'Array cannot be empty');
-
-export const StringArraySchema = z.array(z.string());
-
-// Pagination schemas
+/**
+ * Custom validation for pagination parameters
+ */
 export const PaginationSchema = z.object({
-  page: z.number().min(1).default(1),
-  perPage: z.number().min(1).max(100).default(30),
+  page: z.number().int().min(1, 'Page must be at least 1').default(1),
+  limit: z.number().int().min(1, 'Limit must be at least 1').max(100, 'Limit cannot exceed 100').default(30),
+  sort: z.string().optional(),
+  order: z.enum(['asc', 'desc']).default('desc')
 });
 
-export const LimitSchema = z.object({
-  limit: z.number().min(1).max(100).default(30),
-});
-
-// ID validation helpers
-export function validateGitHubId(id: string, resourceType: string): string {
-  try {
-    return GitHubIdSchema.parse(id);
-  } catch {
-    throw new ValidationError(`Invalid ${resourceType} ID: ${id}`);
+/**
+ * Validate and parse comma-separated values
+ */
+export function parseCommaSeparatedValues(input: string): string[] {
+  if (!input || input.trim() === '') {
+    return [];
   }
+  
+  return input
+    .split(',')
+    .map(item => item.trim())
+    .filter(item => item.length > 0);
 }
 
-export function validateGitHubNodeId(nodeId: string, resourceType: string): string {
-  try {
-    return GitHubNodeIdSchema.parse(nodeId);
-  } catch {
-    throw new ValidationError(`Invalid ${resourceType} node ID: ${nodeId}`);
-  }
+/**
+ * Validate file size
+ */
+export function validateFileSize(size: number, maxSizeBytes: number): boolean {
+  return size > 0 && size <= maxSizeBytes;
 }
 
-// Utility to sanitize user input
-export function sanitizeString(input: string): string {
-  return input.trim().replace(/\s+/g, ' ');
-}
-
-// Utility to validate and sanitize title
-export function validateTitle(title: string): string {
-  const sanitized = sanitizeString(title);
-  return validateSchema(TitleSchema, sanitized);
-}
-
-// Utility to validate and sanitize description
-export function validateDescription(description?: string): string | undefined {
-  if (!description) return undefined;
-  const sanitized = sanitizeString(description);
-  return validateSchema(DescriptionSchema, sanitized);
+/**
+ * Validate MIME type
+ */
+export function validateMimeType(mimeType: string, allowedTypes: string[]): boolean {
+  return allowedTypes.includes(mimeType);
 }

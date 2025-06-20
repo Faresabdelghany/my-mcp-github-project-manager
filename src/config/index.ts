@@ -1,127 +1,171 @@
 import { z } from 'zod';
 import dotenv from 'dotenv';
-import path from 'path';
+import { createModuleLogger } from '@/utils/logger.js';
 
 // Load environment variables
 dotenv.config();
 
-// Configuration schema with validation
+const logger = createModuleLogger('Config');
+
+/**
+ * Configuration schema for validation
+ */
 const ConfigSchema = z.object({
-  // GitHub Configuration
+  // Environment
+  environment: z.enum(['development', 'production', 'test']).default('development'),
+  
+  // Server configuration
+  server: z.object({
+    name: z.string().default('GitHub Project Manager MCP'),
+    version: z.string().default('1.0.0'),
+    host: z.string().default('localhost'),
+    port: z.number().default(3000),
+    timeout: z.number().default(30000),
+  }),
+
+  // GitHub configuration
   github: z.object({
     token: z.string().min(1, 'GitHub token is required'),
-    owner: z.string().min(1, 'GitHub owner is required'),
-    repo: z.string().min(1, 'GitHub repository is required'),
-    apiRateLimit: z.number().default(5000),
-    apiRateWindow: z.number().default(3600000), // 1 hour in ms
+    apiUrl: z.string().url().default('https://api.github.com'),
+    userAgent: z.string().default('GitHub-Project-Manager-MCP/1.0.0'),
+    defaultOwner: z.string().optional(),
+    defaultRepo: z.string().optional(),
+    rateLimit: z.object({
+      requests: z.number().default(5000),
+      window: z.number().default(3600000), // 1 hour in ms
+    }),
   }),
 
-  // Server Configuration
-  server: z.object({
-    port: z.number().default(3001),
-    nodeEnv: z.enum(['development', 'production', 'test']).default('development'),
-    logLevel: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+  // Logging configuration
+  logging: z.object({
+    level: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+    format: z.enum(['json', 'text']).default('text'),
+    enableColors: z.boolean().default(true),
+    enableTimestamp: z.boolean().default(true),
+    maxFiles: z.number().default(5),
+    maxSize: z.string().default('10MB'),
   }),
 
-  // Cache Configuration
-  cache: z.object({
-    directory: z.string().default('.mcp-cache'),
-    ttlSeconds: z.number().default(3600),
+  // Tool configuration
+  tools: z.object({
+    timeout: z.number().default(30000),
+    retries: z.number().default(3),
+    enableMetrics: z.boolean().default(true),
+    enableCaching: z.boolean().default(false),
   }),
 
-  // Sync Configuration
-  sync: z.object({
-    enabled: z.boolean().default(true),
-    timeoutMs: z.number().default(30000),
-    intervalMs: z.number().default(0), // 0 = disabled
-    resources: z.array(z.enum(['PROJECT', 'MILESTONE', 'ISSUE', 'SPRINT'])).default([
-      'PROJECT', 'MILESTONE', 'ISSUE', 'SPRINT'
-    ]),
-  }),
-
-  // Webhook Configuration
-  webhook: z.object({
-    secret: z.string().optional(),
-    port: z.number().default(3001),
-    sseEnabled: z.boolean().default(true),
-    eventRetentionDays: z.number().default(7),
-    maxEventsInMemory: z.number().default(1000),
-    timeoutMs: z.number().default(5000),
-  }),
-
-  // Features
+  // Features flags
   features: z.object({
-    traceability: z.boolean().default(true),
-    webhooks: z.boolean().default(true),
-    persistence: z.boolean().default(true),
+    enableProjectsV2: z.boolean().default(true),
+    enableAdvancedSearch: z.boolean().default(true),
+    enableBulkOperations: z.boolean().default(false),
+    enableWebhooks: z.boolean().default(false),
   }),
 });
 
-export type Config = z.infer<typeof ConfigSchema>;
-
-// Create configuration from environment variables
-function createConfig(): Config {
-  const config = {
-    github: {
-      token: process.env.GITHUB_TOKEN || '',
-      owner: process.env.GITHUB_OWNER || '',
-      repo: process.env.GITHUB_REPO || '',
-      apiRateLimit: parseInt(process.env.GITHUB_API_RATE_LIMIT || '5000'),
-      apiRateWindow: parseInt(process.env.GITHUB_API_RATE_WINDOW || '3600000'),
-    },
+/**
+ * Parse and validate configuration from environment variables
+ */
+function createConfig() {
+  const rawConfig = {
+    environment: process.env.NODE_ENV,
     server: {
-      port: parseInt(process.env.PORT || '3001'),
-      nodeEnv: (process.env.NODE_ENV || 'development') as 'development' | 'production' | 'test',
-      logLevel: (process.env.LOG_LEVEL || 'info') as 'error' | 'warn' | 'info' | 'debug',
+      name: process.env.SERVER_NAME,
+      version: process.env.SERVER_VERSION,
+      host: process.env.SERVER_HOST,
+      port: process.env.SERVER_PORT ? parseInt(process.env.SERVER_PORT) : undefined,
+      timeout: process.env.SERVER_TIMEOUT ? parseInt(process.env.SERVER_TIMEOUT) : undefined,
     },
-    cache: {
-      directory: process.env.CACHE_DIRECTORY || '.mcp-cache',
-      ttlSeconds: parseInt(process.env.CACHE_TTL_SECONDS || '3600'),
+    github: {
+      token: process.env.GITHUB_TOKEN,
+      apiUrl: process.env.GITHUB_API_URL,
+      userAgent: process.env.GITHUB_USER_AGENT,
+      defaultOwner: process.env.GITHUB_DEFAULT_OWNER,
+      defaultRepo: process.env.GITHUB_DEFAULT_REPO,
+      rateLimit: {
+        requests: process.env.GITHUB_RATE_LIMIT_REQUESTS ? parseInt(process.env.GITHUB_RATE_LIMIT_REQUESTS) : undefined,
+        window: process.env.GITHUB_RATE_LIMIT_WINDOW ? parseInt(process.env.GITHUB_RATE_LIMIT_WINDOW) : undefined,
+      },
     },
-    sync: {
-      enabled: process.env.SYNC_ENABLED !== 'false',
-      timeoutMs: parseInt(process.env.SYNC_TIMEOUT_MS || '30000'),
-      intervalMs: parseInt(process.env.SYNC_INTERVAL_MS || '0'),
-      resources: (process.env.SYNC_RESOURCES || 'PROJECT,MILESTONE,ISSUE,SPRINT')
-        .split(',')
-        .map(r => r.trim()) as Array<'PROJECT' | 'MILESTONE' | 'ISSUE' | 'SPRINT'>,
+    logging: {
+      level: process.env.LOG_LEVEL,
+      format: process.env.LOG_FORMAT,
+      enableColors: process.env.LOG_ENABLE_COLORS ? process.env.LOG_ENABLE_COLORS === 'true' : undefined,
+      enableTimestamp: process.env.LOG_ENABLE_TIMESTAMP ? process.env.LOG_ENABLE_TIMESTAMP === 'true' : undefined,
+      maxFiles: process.env.LOG_MAX_FILES ? parseInt(process.env.LOG_MAX_FILES) : undefined,
+      maxSize: process.env.LOG_MAX_SIZE,
     },
-    webhook: {
-      secret: process.env.WEBHOOK_SECRET,
-      port: parseInt(process.env.WEBHOOK_PORT || '3001'),
-      sseEnabled: process.env.SSE_ENABLED !== 'false',
-      eventRetentionDays: parseInt(process.env.EVENT_RETENTION_DAYS || '7'),
-      maxEventsInMemory: parseInt(process.env.MAX_EVENTS_IN_MEMORY || '1000'),
-      timeoutMs: parseInt(process.env.WEBHOOK_TIMEOUT_MS || '5000'),
+    tools: {
+      timeout: process.env.TOOLS_TIMEOUT ? parseInt(process.env.TOOLS_TIMEOUT) : undefined,
+      retries: process.env.TOOLS_RETRIES ? parseInt(process.env.TOOLS_RETRIES) : undefined,
+      enableMetrics: process.env.TOOLS_ENABLE_METRICS ? process.env.TOOLS_ENABLE_METRICS === 'true' : undefined,
+      enableCaching: process.env.TOOLS_ENABLE_CACHING ? process.env.TOOLS_ENABLE_CACHING === 'true' : undefined,
     },
     features: {
-      traceability: process.env.ENABLE_TRACEABILITY !== 'false',
-      webhooks: process.env.ENABLE_WEBHOOKS !== 'false',
-      persistence: process.env.ENABLE_PERSISTENCE !== 'false',
+      enableProjectsV2: process.env.FEATURE_PROJECTS_V2 ? process.env.FEATURE_PROJECTS_V2 === 'true' : undefined,
+      enableAdvancedSearch: process.env.FEATURE_ADVANCED_SEARCH ? process.env.FEATURE_ADVANCED_SEARCH === 'true' : undefined,
+      enableBulkOperations: process.env.FEATURE_BULK_OPERATIONS ? process.env.FEATURE_BULK_OPERATIONS === 'true' : undefined,
+      enableWebhooks: process.env.FEATURE_WEBHOOKS ? process.env.FEATURE_WEBHOOKS === 'true' : undefined,
     },
   };
 
-  // Validate configuration
   try {
-    return ConfigSchema.parse(config);
+    const validatedConfig = ConfigSchema.parse(rawConfig);
+    logger.info('Configuration loaded successfully', {
+      environment: validatedConfig.environment,
+      serverName: validatedConfig.server.name,
+      hasGitHubToken: !!validatedConfig.github.token,
+    });
+    return validatedConfig;
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const issues = error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`);
-      throw new Error(`Configuration validation failed:\n${issues.join('\n')}`);
+      const errorMessages = error.errors.map(err => 
+        `${err.path.join('.')}: ${err.message}`
+      ).join(', ');
+      logger.error('Configuration validation failed', { errors: errorMessages });
+      throw new Error(`Configuration validation failed: ${errorMessages}`);
     }
     throw error;
   }
 }
 
-// Export the configuration instance
+/**
+ * Export the validated configuration
+ */
 export const config = createConfig();
 
-// Helper function to get cache path
-export function getCachePath(filename: string): string {
-  return path.join(config.cache.directory, filename);
+/**
+ * Configuration type
+ */
+export type Config = z.infer<typeof ConfigSchema>;
+
+/**
+ * Check if required configuration is present
+ */
+export function validateRequiredConfig(): void {
+  const requiredFields = [
+    'github.token'
+  ];
+
+  for (const field of requiredFields) {
+    const keys = field.split('.');
+    let value: any = config;
+    
+    for (const key of keys) {
+      value = value?.[key];
+    }
+
+    if (!value) {
+      throw new Error(`Required configuration field '${field}' is missing`);
+    }
+  }
+
+  logger.info('Required configuration validation passed');
 }
 
-// Helper function to check if feature is enabled
-export function isFeatureEnabled(feature: keyof Config['features']): boolean {
-  return config.features[feature];
+/**
+ * Get configuration for a specific module
+ */
+export function getModuleConfig<K extends keyof Config>(module: K): Config[K] {
+  return config[module];
 }

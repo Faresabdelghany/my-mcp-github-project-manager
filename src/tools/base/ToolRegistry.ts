@@ -1,207 +1,189 @@
-import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { BaseTool } from './BaseTool.js';
 import { createModuleLogger } from '@/utils/logger.js';
-import { ValidationError } from '@/utils/errors.js';
+import { ToolResult } from '@/types/tools.js';
 
-export interface ToolCategory {
-  name: string;
-  description: string;
-  tools: string[];
-}
-
+/**
+ * Registry for managing and organizing MCP tools
+ * Provides tool discovery, registration, and execution capabilities
+ */
 export class ToolRegistry {
   private tools = new Map<string, BaseTool>();
-  private categories = new Map<string, ToolCategory>();
+  private categories = new Map<string, Set<string>>();
   private logger = createModuleLogger('ToolRegistry');
 
-  // Register a single tool
-  register(tool: BaseTool): void {
+  /**
+   * Register a tool with the registry
+   */
+  async registerTool(tool: BaseTool): Promise<void> {
     const name = tool.metadata.name;
     
     if (this.tools.has(name)) {
-      throw new ValidationError(`Tool '${name}' is already registered`);
+      this.logger.warn('Tool already registered, overwriting', { toolName: name });
     }
 
     this.tools.set(name, tool);
-    this.logger.info(`Registered tool: ${name}`);
-  }
-
-  // Register multiple tools
-  registerTools(tools: BaseTool[]): void {
-    for (const tool of tools) {
-      this.register(tool);
-    }
-  }
-
-  // Register a category of tools
-  registerCategory(category: ToolCategory): void {
-    if (this.categories.has(category.name)) {
-      throw new ValidationError(`Category '${category.name}' is already registered`);
+    
+    // Add to category if specified
+    if (tool.metadata.category) {
+      if (!this.categories.has(tool.metadata.category)) {
+        this.categories.set(tool.metadata.category, new Set());
+      }
+      this.categories.get(tool.metadata.category)!.add(name);
     }
 
-    this.categories.set(category.name, category);
-    this.logger.info(`Registered category: ${category.name}`, {
-      toolCount: category.tools.length,
+    this.logger.info('Tool registered successfully', {
+      toolName: name,
+      category: tool.metadata.category,
+      version: tool.metadata.version
     });
   }
 
-  // Get a specific tool
-  getTool(name: string): BaseTool {
-    const tool = this.tools.get(name);
-    if (!tool) {
-      throw new ValidationError(`Tool '${name}' not found`);
-    }
-    return tool;
+  /**
+   * Get a tool by name
+   */
+  getTool(name: string): BaseTool | undefined {
+    return this.tools.get(name);
   }
 
-  // Get all registered tools
-  getTools(): BaseTool[] {
+  /**
+   * Get all registered tools
+   */
+  getAllTools(): BaseTool[] {
     return Array.from(this.tools.values());
   }
 
-  // Get tool names
-  getToolNames(): string[] {
-    return Array.from(this.tools.keys());
-  }
-
-  // Get MCP tool definitions
-  getMcpTools(): Tool[] {
-    return this.getTools().map(tool => tool.getTool());
-  }
-
-  // Get tools by category
-  getToolsByCategory(categoryName: string): BaseTool[] {
-    const category = this.categories.get(categoryName);
-    if (!category) {
+  /**
+   * Get tools by category
+   */
+  getToolsByCategory(category: string): BaseTool[] {
+    const toolNames = this.categories.get(category);
+    if (!toolNames) {
       return [];
     }
 
-    return category.tools
-      .map(toolName => this.tools.get(toolName))
+    return Array.from(toolNames)
+      .map(name => this.tools.get(name))
       .filter((tool): tool is BaseTool => tool !== undefined);
   }
 
-  // Get all categories
-  getCategories(): ToolCategory[] {
-    return Array.from(this.categories.values());
+  /**
+   * Get all available categories
+   */
+  getCategories(): string[] {
+    return Array.from(this.categories.keys());
   }
 
-  // Check if tool exists
+  /**
+   * Check if a tool exists
+   */
   hasTool(name: string): boolean {
     return this.tools.has(name);
   }
 
-  // Execute a tool by name
-  async executeTool(name: string, args: unknown): Promise<any> {
+  /**
+   * Execute a tool by name
+   */
+  async executeTool<T = any>(name: string, input: any): Promise<ToolResult<T>> {
     const tool = this.getTool(name);
-    
-    this.logger.info(`Executing tool: ${name}`, { args });
-    const startTime = Date.now();
-
-    try {
-      const result = await tool.execute(args);
-      const duration = Date.now() - startTime;
-      
-      this.logger.info(`Tool execution completed: ${name}`, {
-        duration: `${duration}ms`,
-        success: true,
-      });
-
-      return result;
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      
-      this.logger.error(`Tool execution failed: ${name}`, {
-        duration: `${duration}ms`,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      throw error;
+    if (!tool) {
+      return {
+        success: false,
+        error: {
+          message: `Tool '${name}' not found`,
+          code: 'TOOL_NOT_FOUND'
+        },
+        metadata: {
+          toolName: name,
+          executionTime: new Date().toISOString()
+        }
+      };
     }
+
+    return tool.execute(input);
   }
 
-  // Get registry statistics
+  /**
+   * Get registry statistics
+   */
   getStats() {
     const toolsByCategory = new Map<string, number>();
     
-    for (const category of this.categories.values()) {
-      toolsByCategory.set(category.name, category.tools.length);
+    for (const [category, tools] of this.categories) {
+      toolsByCategory.set(category, tools.size);
     }
 
     return {
       totalTools: this.tools.size,
       totalCategories: this.categories.size,
       toolsByCategory: Object.fromEntries(toolsByCategory),
-      registeredTools: this.getToolNames(),
+      tools: Array.from(this.tools.keys())
     };
   }
 
-  // Validate tool registration (useful for testing)
-  validateRegistration(): { valid: boolean; issues: string[] } {
-    const issues: string[] = [];
-
-    // Check for duplicate tool names
-    const toolNames = new Set<string>();
-    for (const tool of this.tools.values()) {
-      if (toolNames.has(tool.metadata.name)) {
-        issues.push(`Duplicate tool name: ${tool.metadata.name}`);
-      }
-      toolNames.add(tool.metadata.name);
-    }
-
-    // Check category references
-    for (const category of this.categories.values()) {
-      for (const toolName of category.tools) {
-        if (!this.tools.has(toolName)) {
-          issues.push(`Category '${category.name}' references unknown tool: ${toolName}`);
-        }
-      }
-    }
-
-    // Check for orphaned tools (not in any category)
-    const categorizedTools = new Set<string>();
-    for (const category of this.categories.values()) {
-      for (const toolName of category.tools) {
-        categorizedTools.add(toolName);
-      }
-    }
-
-    for (const toolName of this.tools.keys()) {
-      if (!categorizedTools.has(toolName)) {
-        issues.push(`Tool '${toolName}' is not assigned to any category`);
-      }
-    }
-
-    return {
-      valid: issues.length === 0,
-      issues,
-    };
+  /**
+   * Get tool metadata for documentation
+   */
+  getToolsMetadata() {
+    return Array.from(this.tools.values()).map(tool => ({
+      name: tool.metadata.name,
+      description: tool.metadata.description,
+      category: tool.metadata.category,
+      subcategory: tool.metadata.subcategory,
+      functionType: tool.metadata.functionType,
+      version: tool.metadata.version,
+      stability: tool.metadata.stability,
+      tags: tool.metadata.tags,
+      examples: tool.metadata.examples
+    }));
   }
 
-  // Clear all registrations (useful for testing)
+  /**
+   * Search tools by name or description
+   */
+  searchTools(query: string): BaseTool[] {
+    const lowerQuery = query.toLowerCase();
+    
+    return Array.from(this.tools.values()).filter(tool => 
+      tool.metadata.name.toLowerCase().includes(lowerQuery) ||
+      tool.metadata.description.toLowerCase().includes(lowerQuery) ||
+      (tool.metadata.tags && tool.metadata.tags.some(tag => 
+        tag.toLowerCase().includes(lowerQuery)
+      ))
+    );
+  }
+
+  /**
+   * Clear all registered tools
+   */
   clear(): void {
     this.tools.clear();
     this.categories.clear();
     this.logger.info('Tool registry cleared');
   }
 
-  // Get detailed tool information for documentation
-  getToolDocumentation() {
-    return {
-      categories: Array.from(this.categories.values()).map(category => ({
-        name: category.name,
-        description: category.description,
-        tools: category.tools.map(toolName => {
-          const tool = this.tools.get(toolName);
-          return tool ? {
-            name: tool.metadata.name,
-            description: tool.metadata.description,
-            inputSchema: tool.metadata.inputSchema,
-            examples: tool.metadata.examples || [],
-          } : null;
-        }).filter(Boolean),
-      })),
-      stats: this.getStats(),
-    };
+  /**
+   * Unregister a specific tool
+   */
+  unregisterTool(name: string): boolean {
+    const tool = this.tools.get(name);
+    if (!tool) {
+      return false;
+    }
+
+    this.tools.delete(name);
+    
+    // Remove from category
+    if (tool.metadata.category) {
+      const categoryTools = this.categories.get(tool.metadata.category);
+      if (categoryTools) {
+        categoryTools.delete(name);
+        if (categoryTools.size === 0) {
+          this.categories.delete(tool.metadata.category);
+        }
+      }
+    }
+
+    this.logger.info('Tool unregistered', { toolName: name });
+    return true;
   }
 }
