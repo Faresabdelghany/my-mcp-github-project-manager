@@ -2,144 +2,159 @@ import { z } from 'zod';
 import { BaseTool, ToolMetadata } from '@/tools/base/BaseTool.js';
 import { UpdateIssueSchema, type UpdateIssueRequest } from '@/domain/schemas/issue.schema.js';
 import { GitHubClient } from '@/infrastructure/github/GitHubClient.js';
-import { createModuleLogger } from '@/utils/logger.js';
-import { ToolResult } from '@/types/tools.js';
 
-/**
- * Tool for updating GitHub issue properties
- */
-export class UpdateIssueTool extends BaseTool<UpdateIssueRequest> {
-  public readonly metadata: ToolMetadata = {
+export class UpdateIssueTool extends BaseTool {
+  private githubClient = new GitHubClient();
+
+  readonly metadata: ToolMetadata = {
     name: 'update_issue',
-    description: 'Update an existing GitHub issue',
-    category: 'github',
-    subcategory: 'issues',
-    functionType: 'update',
-    version: '1.0.0',
-    stability: 'stable'
+    description: 'Update an existing GitHub issue with new information, assignments, and workflow changes',
+    inputSchema: UpdateIssueSchema,
+    examples: [
+      {
+        name: 'Close Issue',
+        description: 'Mark an issue as closed when completed',
+        arguments: {
+          issueNumber: 42,
+          state: 'closed'
+        }
+      },
+      {
+        name: 'Update Assignment',
+        description: 'Change issue assignees and add labels',
+        arguments: {
+          issueNumber: 15,
+          assignees: ['developer2', 'designer1'],
+          labels: ['in-progress', 'high-priority', 'frontend']
+        }
+      },
+      {
+        name: 'Update Description',
+        description: 'Modify issue title and description',
+        arguments: {
+          issueNumber: 23,
+          title: 'Implement user authentication with OAuth',
+          body: 'Updated requirements: Support Google, GitHub, and Microsoft OAuth providers. Include proper error handling and user profile management.'
+        }
+      },
+      {
+        name: 'Set Milestone',
+        description: 'Assign issue to a milestone',
+        arguments: {
+          issueNumber: 8,
+          milestone: 5,
+          labels: ['sprint-15']
+        }
+      }
+    ]
   };
 
-  public readonly schema = UpdateIssueSchema;
-  private readonly githubClient: GitHubClient;
-  private readonly logger = createModuleLogger('UpdateIssueTool');
-
-  constructor() {
-    super();
-    this.githubClient = new GitHubClient();
-  }
-
-  protected async executeImpl(args: UpdateIssueRequest): Promise<ToolResult> {
+  protected async executeImpl(args: UpdateIssueRequest): Promise<any> {
     try {
-      this.logger.info('Updating GitHub issue', { issueId: args.issueId });
+      // Get current issue state for comparison
+      const currentIssue = await this.githubClient.getIssue(args.issueNumber);
 
-      // Parse issue number from ID
-      const issueNumber = parseInt(args.issueId);
-      if (isNaN(issueNumber)) {
-        throw new Error('Invalid issue ID format. Expected a number.');
-      }
-
-      // Get current issue to compare changes
-      const currentIssue = await this.githubClient.getIssue(issueNumber);
-
-      // Track what we're updating
-      const changes: string[] = [];
+      // Build update request with only changed fields
       const updateRequest: any = {};
+      const changes: string[] = [];
 
       if (args.title && args.title !== currentIssue.title) {
         updateRequest.title = args.title;
-        changes.push('title updated');
+        changes.push(`title updated`);
       }
 
-      if (args.description !== undefined && args.description !== currentIssue.body) {
-        updateRequest.body = args.description;
+      if (args.body !== undefined && args.body !== currentIssue.body) {
+        updateRequest.body = args.body;
         changes.push('description updated');
       }
 
-      if (args.status && args.status !== currentIssue.state) {
-        updateRequest.state = args.status;
-        changes.push(`status changed to ${args.status}`);
+      if (args.state && args.state !== currentIssue.state) {
+        updateRequest.state = args.state;
+        changes.push(`state: ${currentIssue.state} → ${args.state}`);
       }
 
       if (args.assignees) {
-        updateRequest.assignees = args.assignees;
-        changes.push('assignees updated');
-      }
-
-      if (args.labels) {
-        updateRequest.labels = args.labels;
-        changes.push('labels updated');
-      }
-
-      if (args.milestoneId) {
-        const milestoneNumber = parseInt(args.milestoneId);
-        if (!isNaN(milestoneNumber)) {
-          updateRequest.milestone = milestoneNumber;
-          changes.push('milestone updated');
+        const currentAssignees = currentIssue.assignees.map(a => a.login).sort();
+        const newAssignees = args.assignees.sort();
+        if (JSON.stringify(currentAssignees) !== JSON.stringify(newAssignees)) {
+          updateRequest.assignees = args.assignees;
+          changes.push(`assignees: [${currentAssignees.join(', ')}] → [${newAssignees.join(', ')}]`);
         }
       }
 
-      // Only update if there are changes
-      if (changes.length === 0) {
-        return this.createSuccessResponse({
-          success: true,
-          data: {
+      if (args.labels) {
+        const currentLabels = currentIssue.labels.map(l => l.name).sort();
+        const newLabels = args.labels.sort();
+        if (JSON.stringify(currentLabels) !== JSON.stringify(newLabels)) {
+          updateRequest.labels = args.labels;
+          changes.push(`labels: [${currentLabels.join(', ')}] → [${newLabels.join(', ')}]`);
+        }
+      }
+
+      if (args.milestone !== undefined) {
+        const currentMilestone = currentIssue.milestone?.number;
+        if (currentMilestone !== args.milestone) {
+          updateRequest.milestone = args.milestone;
+          changes.push(`milestone: ${currentMilestone || 'none'} → ${args.milestone || 'none'}`);
+        }
+      }
+
+      // Check if there are any changes to apply
+      if (Object.keys(updateRequest).length === 0) {
+        return this.createSuccessResponse(
+          {
             issue: {
               id: currentIssue.id,
               number: currentIssue.number,
               title: currentIssue.title,
-              description: currentIssue.body,
-              state: currentIssue.state
+              state: currentIssue.state,
+              url: currentIssue.html_url,
+              assignees: currentIssue.assignees.map(a => a.login),
+              labels: currentIssue.labels.map(l => l.name),
+              milestone: currentIssue.milestone?.number || null
             },
-            changes: [],
-            metadata: {
-              issueId: args.issueId,
-              noChangesDetected: true
-            }
+            changes: []
           },
-          message: `No changes detected for issue #${issueNumber}`
-        });
+          'No changes detected - issue is already up to date'
+        );
       }
 
       // Update the issue
-      const updatedIssue = await this.githubClient.updateIssue(issueNumber, updateRequest);
+      const updatedIssue = await this.githubClient.updateIssue(args.issueNumber, updateRequest);
 
-      const response = {
-        success: true,
-        data: {
+      return this.createSuccessResponse(
+        {
           issue: {
             id: updatedIssue.id,
             number: updatedIssue.number,
             title: updatedIssue.title,
-            description: updatedIssue.body,
+            body: updatedIssue.body,
             state: updatedIssue.state,
-            assignees: updatedIssue.assignees?.map(a => a.login) || [],
-            labels: updatedIssue.labels?.map(l => typeof l === 'string' ? l : l.name) || [],
-            milestone: updatedIssue.milestone?.title,
             url: updatedIssue.html_url,
+            assignees: updatedIssue.assignees.map(a => ({
+              login: a.login,
+              name: a.name
+            })),
+            labels: updatedIssue.labels.map(l => ({
+              name: l.name,
+              color: l.color
+            })),
+            milestone: updatedIssue.milestone ? {
+              number: updatedIssue.milestone.number,
+              title: updatedIssue.milestone.title,
+              state: updatedIssue.milestone.state
+            } : null,
             updatedAt: updatedIssue.updated_at
           },
           changes,
-          metadata: {
-            issueId: args.issueId,
-            issueNumber: updatedIssue.number,
-            updatedFields: changes,
-            milestoneId: args.milestoneId,
-            updatedAt: new Date().toISOString()
-          }
+          changesSummary: `Applied ${changes.length} change${changes.length === 1 ? '' : 's'}`
         },
-        message: `Successfully updated issue #${updatedIssue.number}. Changes: ${changes.join(', ')}`
-      };
-
-      this.logger.info('Issue updated successfully', { issueNumber: updatedIssue.number, changes });
-      return this.createSuccessResponse(response);
+        `Issue #${updatedIssue.number} "${updatedIssue.title}" updated successfully`
+      );
 
     } catch (error) {
       this.logger.error('Failed to update issue', { error, args });
-      return this.createErrorResponse(
-        `Failed to update issue '${args.issueId}': ${error}`,
-        'ISSUE_UPDATE_FAILED',
-        { args, error: String(error) }
-      );
+      throw error;
     }
   }
 }

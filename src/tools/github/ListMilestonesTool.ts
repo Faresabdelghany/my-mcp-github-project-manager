@@ -2,98 +2,161 @@ import { z } from 'zod';
 import { BaseTool, ToolMetadata } from '@/tools/base/BaseTool.js';
 import { ListMilestonesSchema, type ListMilestonesRequest } from '@/domain/schemas/milestone.schema.js';
 import { GitHubClient } from '@/infrastructure/github/GitHubClient.js';
-import { createModuleLogger } from '@/utils/logger.js';
-import { ToolResult } from '@/types/tools.js';
 
-/**
- * Tool for listing GitHub milestones with filtering and pagination
- */
-export class ListMilestonesTool extends BaseTool<ListMilestonesRequest> {
-  public readonly metadata: ToolMetadata = {
+export class ListMilestonesTool extends BaseTool {
+  private githubClient = new GitHubClient();
+
+  readonly metadata: ToolMetadata = {
     name: 'list_milestones',
-    description: 'List all milestones',
-    category: 'github',
-    subcategory: 'milestones',
-    functionType: 'read',
-    version: '1.0.0',
-    stability: 'stable'
+    description: 'List repository milestones with progress tracking and filtering options',
+    inputSchema: ListMilestonesSchema,
+    examples: [
+      {
+        name: 'Open Milestones',
+        description: 'Get all open milestones ordered by due date',
+        arguments: {
+          state: 'open',
+          sort: 'due_on',
+          direction: 'asc'
+        }
+      },
+      {
+        name: 'Completed Milestones',
+        description: 'Get closed milestones by completion percentage',
+        arguments: {
+          state: 'closed',
+          sort: 'completeness',
+          direction: 'desc',
+          perPage: 10
+        }
+      },
+      {
+        name: 'All Milestones',
+        description: 'Get all milestones with pagination',
+        arguments: {
+          state: 'all',
+          perPage: 50,
+          page: 1
+        }
+      }
+    ]
   };
 
-  public readonly schema = ListMilestonesSchema;
-  private readonly githubClient: GitHubClient;
-  private readonly logger = createModuleLogger('ListMilestonesTool');
-
-  constructor() {
-    super();
-    this.githubClient = new GitHubClient();
-  }
-
-  protected async executeImpl(args: ListMilestonesRequest): Promise<ToolResult> {
+  protected async executeImpl(args: ListMilestonesRequest): Promise<any> {
     try {
-      this.logger.info('Listing GitHub milestones', { 
-        status: args.status,
+      // Fetch milestones from GitHub API
+      const milestones = await this.githubClient.listMilestones({
+        state: args.state,
         sort: args.sort,
-        direction: args.direction
+        direction: args.direction,
+        per_page: args.perPage,
+        page: args.page
       });
 
-      // Prepare filter options
-      const options = {
-        state: args.status,
-        sort: args.sort,
-        direction: args.direction
+      // Calculate current date for time-based calculations
+      const now = new Date();
+
+      // Format milestones data for response
+      const formattedMilestones = milestones.map(milestone => {
+        const totalIssues = milestone.open_issues + milestone.closed_issues;
+        const completionPercentage = totalIssues > 0 
+          ? Math.round((milestone.closed_issues / totalIssues) * 100)
+          : 0;
+
+        const dueDate = milestone.due_on ? new Date(milestone.due_on) : null;
+        const timeInfo = dueDate ? {
+          daysUntilDue: Math.ceil((dueDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)),
+          isOverdue: dueDate < now,
+          formattedDueDate: dueDate.toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric'
+          })
+        } : null;
+
+        return {
+          id: milestone.id,
+          number: milestone.number,
+          title: milestone.title,
+          description: milestone.description,
+          state: milestone.state,
+          url: milestone.html_url,
+          creator: milestone.creator.login,
+          createdAt: milestone.created_at,
+          updatedAt: milestone.updated_at,
+          closedAt: milestone.closed_at,
+          dueOn: milestone.due_on,
+          progress: {
+            openIssues: milestone.open_issues,
+            closedIssues: milestone.closed_issues,
+            totalIssues,
+            completionPercentage
+          },
+          timeline: timeInfo
+        };
+      });
+
+      // Generate summary statistics
+      const summary = {
+        total: formattedMilestones.length,
+        byState: formattedMilestones.reduce((acc, milestone) => {
+          acc[milestone.state] = (acc[milestone.state] || 0) + 1;
+          return acc;
+        }, {} as Record<string, number>),
+        totalIssues: formattedMilestones.reduce((sum, m) => sum + m.progress.totalIssues, 0),
+        totalOpenIssues: formattedMilestones.reduce((sum, m) => sum + m.progress.openIssues, 0),
+        totalClosedIssues: formattedMilestones.reduce((sum, m) => sum + m.progress.closedIssues, 0),
+        withDueDates: formattedMilestones.filter(m => m.dueOn).length,
+        overdue: formattedMilestones.filter(m => m.timeline?.isOverdue).length,
+        averageCompletion: formattedMilestones.length > 0 
+          ? Math.round(formattedMilestones.reduce((sum, m) => sum + m.progress.completionPercentage, 0) / formattedMilestones.length)
+          : 0
       };
 
-      // Get milestones from GitHub API
-      const milestonesResponse = await this.githubClient.listMilestones(options);
+      // Provide insights and recommendations
+      const insights = {
+        mostActiveLabel: summary.byState.open > summary.byState.closed ? 'open' : 'closed',
+        upcomingDeadlines: formattedMilestones
+          .filter(m => m.timeline && m.timeline.daysUntilDue <= 7 && m.timeline.daysUntilDue > 0)
+          .length,
+        completedRecently: formattedMilestones
+          .filter(m => m.state === 'closed' && m.closedAt)
+          .filter(m => {
+            const closedDate = new Date(m.closedAt!);
+            const daysSinceClosed = (now.getTime() - closedDate.getTime()) / (1000 * 60 * 60 * 24);
+            return daysSinceClosed <= 30;
+          }).length,
+        needsAttention: formattedMilestones.filter(m => 
+          m.state === 'open' && 
+          (m.timeline?.isOverdue || (m.timeline?.daysUntilDue !== null && m.timeline.daysUntilDue <= 3))
+        ).length
+      };
 
-      const response = {
-        success: true,
-        data: {
-          milestones: milestonesResponse.data.map(milestone => ({
-            id: milestone.id,
-            number: milestone.number,
-            title: milestone.title,
-            description: milestone.description,
-            state: milestone.state,
-            dueDate: milestone.due_on,
-            url: milestone.html_url,
-            createdAt: milestone.created_at,
-            updatedAt: milestone.updated_at,
-            closedAt: milestone.closed_at,
-            openIssues: milestone.open_issues || 0,
-            closedIssues: milestone.closed_issues || 0,
-            progress: {
-              total: (milestone.open_issues || 0) + (milestone.closed_issues || 0),
-              completed: milestone.closed_issues || 0,
-              percentage: milestone.open_issues || milestone.closed_issues ? 
-                Math.round(((milestone.closed_issues || 0) / 
-                ((milestone.open_issues || 0) + (milestone.closed_issues || 0))) * 100) : 0
-            }
-          })),
-          pagination: milestonesResponse.pagination,
-          metadata: {
-            filters: {
-              status: args.status,
-              sort: args.sort,
-              direction: args.direction
-            },
-            totalRetrieved: milestonesResponse.data.length,
-            retrievedAt: new Date().toISOString()
-          }
+      return this.createSuccessResponse(
+        {
+          milestones: formattedMilestones,
+          summary,
+          insights,
+          pagination: {
+            page: args.page || 1,
+            perPage: args.perPage || 30,
+            hasMore: formattedMilestones.length === (args.perPage || 30)
+          },
+          filters: {
+            state: args.state,
+            sort: args.sort,
+            direction: args.direction
+          },
+          recommendations: insights.needsAttention > 0 ? [
+            `${insights.needsAttention} milestone${insights.needsAttention === 1 ? '' : 's'} need immediate attention due to upcoming or overdue deadlines`
+          ] : ['All milestones are on track!']
         },
-        message: `Found ${milestonesResponse.data.length} milestones with status '${args.status}'`
-      };
-
-      this.logger.info('Milestones listed successfully', { count: milestonesResponse.data.length });
-      return this.createSuccessResponse(response);
+        `Found ${formattedMilestones.length} milestones with ${summary.averageCompletion}% average completion`
+      );
 
     } catch (error) {
       this.logger.error('Failed to list milestones', { error, args });
-      return this.createErrorResponse(
-        `Failed to list milestones: ${error}`,
-        'MILESTONE_LIST_FAILED',
-        { args, error: String(error) }
-      );
+      throw error;
     }
   }
 }
